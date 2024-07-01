@@ -12,9 +12,11 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.*;
 
-public class MyProcessor implements NodeProcessor {
+import java.util.stream.Collectors;
 
-    private static Logger logger = LoggerFactory.getLogger(MyProcessor.class);
+public class HiveSqlParser implements NodeProcessor {
+
+    private static Logger logger = LoggerFactory.getLogger(HiveSqlParser.class);
     private static Context context = null;
     private final static String HDFS_SESSION_PATH_KEY = "_hive.hdfs.session.path";
     private final static String LOCAL_SESSION_PATH_KEY = "_hive.local.session.path";
@@ -43,6 +45,7 @@ public class MyProcessor implements NodeProcessor {
     }
 
     List<String> tableNames = new ArrayList<>();
+    Set<String> cteNames = new HashSet<>();
 
     public void parse(String query) throws ParseException, SemanticException {
         ParseDriver pd = new ParseDriver();
@@ -56,8 +59,6 @@ public class MyProcessor implements NodeProcessor {
 
         // Traverse the AST
         ogw.startWalking(topNodes, null);
-        // Print extracted table names
-        System.out.println(tableNames);
     }
 
     @Override
@@ -93,7 +94,10 @@ public class MyProcessor implements NodeProcessor {
         for (Node child : pt.getChildren()) {
             ASTNode createTableChild = (ASTNode) child;
             if (createTableChild.getToken().getType() == HiveParser.TOK_TABNAME) {
-                tableNames.add(BaseSemanticAnalyzer.getUnescapedName(createTableChild));
+                String tableName = BaseSemanticAnalyzer.getUnescapedName(createTableChild);
+                if (!tableNames.contains(tableName)) {
+                    tableNames.add(tableName);
+                }
             } else if (createTableChild.getToken().getType() == HiveParser.TOK_QUERY) {
                 // This is a CTAS statement
                 extractTableNamesFromQuery(createTableChild);
@@ -105,7 +109,10 @@ public class MyProcessor implements NodeProcessor {
         for (Node node : pt.getChildren()) {
             ASTNode insertNode = (ASTNode) node;
             if (insertNode.getToken().getType() == HiveParser.TOK_TAB) {
-                tableNames.add(BaseSemanticAnalyzer.getUnescapedName(insertNode));
+                String tableName = BaseSemanticAnalyzer.getUnescapedName(insertNode);
+                if (!tableNames.contains(tableName)) {
+                    tableNames.add(tableName);
+                }
             }
         }
     }
@@ -142,25 +149,19 @@ public class MyProcessor implements NodeProcessor {
             case HiveParser.TOK_FROM:
                 for (Node child : pt.getChildren()) {
                     if (child instanceof ASTNode && ((ASTNode) child).getToken().getType() == HiveParser.TOK_TABREF) {
-                        ASTNode tableRef = (ASTNode) child;
-                        // Assuming TOK_TABREF node has children and first child is the actual table reference
-                        if (tableRef.getChildCount() > 0) {
-                            ASTNode actualTableRef = (ASTNode) tableRef.getChild(0);
-                            if (actualTableRef != null) {
-                                tableNames.add(BaseSemanticAnalyzer.getUnescapedName(actualTableRef));
-                            }
-                        }
+                        extractTableNamesFromTabref((ASTNode) child);
                     } else {
                         extractTableNamesFromQuery((ASTNode) child); // Handle other types of FROM clauses
                     }
                 }
                 break;
             case HiveParser.TOK_TABREF:
-                ASTNode tabTree = (ASTNode) pt.getChild(0);
-                String table_name = (tabTree.getChildCount() == 1) ?
-                        BaseSemanticAnalyzer.getUnescapedName((ASTNode)tabTree.getChild(0)) :
-                        BaseSemanticAnalyzer.getUnescapedName((ASTNode)tabTree.getChild(0)) + "." + tabTree.getChild(1);
-                tableNames.add(table_name);
+                extractTableNamesFromTabref(pt);
+                break;
+            case HiveParser.TOK_LATERAL_VIEW:
+                for (Node child : pt.getChildren()) {
+                    extractTableNamesFromQuery((ASTNode) child); // Recursively process children of TOK_LATERAL_VIEW
+                }
                 break;
             default:
                 // Handle other cases if needed
@@ -168,6 +169,16 @@ public class MyProcessor implements NodeProcessor {
         }
     }
 
+    private void extractTableNamesFromTabref(ASTNode tabref) {
+        ASTNode tableTree = (ASTNode) tabref.getChild(0);
+        String tableName = BaseSemanticAnalyzer.getUnescapedName((ASTNode) tableTree.getChild(0));
+        if (tableTree.getChildCount() > 1) {
+            tableName = tableName + "." + tableTree.getChild(1);
+        }
+        if (!tableNames.contains(tableName) && !cteNames.contains(tableName)) {
+            tableNames.add(tableName);
+        }
+    }
 
     private void extractTableNamesFromSelect(ASTNode pt) {
         if (pt == null) return;
@@ -192,12 +203,14 @@ public class MyProcessor implements NodeProcessor {
             if (exprNode.getToken().getType() == HiveParser.TOK_TABLE_OR_COL) {
                 ASTNode tableRef = (ASTNode) exprNode.getChild(0);
                 if (tableRef != null && tableRef.getToken() != null) {
-                    tableNames.add(BaseSemanticAnalyzer.getUnescapedName(tableRef));
+                    String tableName = BaseSemanticAnalyzer.getUnescapedName(tableRef);
+                    if (!tableNames.contains(tableName) && !cteNames.contains(tableName)) {
+                        tableNames.add(tableName);
+                    }
                 }
             }
         }
     }
-
 
     private void extractTableNamesFromWhere(ASTNode pt) {
         if (pt == null) return;
@@ -219,7 +232,10 @@ public class MyProcessor implements NodeProcessor {
                 if (exprNode.getToken().getType() == HiveParser.TOK_TABLE_OR_COL) {
                     ASTNode tableRef = (ASTNode) exprNode.getChild(0);
                     if (tableRef != null && tableRef.getToken() != null) {
-                        tableNames.add(BaseSemanticAnalyzer.getUnescapedName(tableRef));
+                        String tableName = BaseSemanticAnalyzer.getUnescapedName(tableRef);
+                        if (!tableNames.contains(tableName) && !cteNames.contains(tableName)) {
+                            tableNames.add(tableName);
+                        }
                     }
                 }
                 extractTableNamesFromWhereExpr(exprNode); // Recursive call for nested expressions
@@ -233,14 +249,42 @@ public class MyProcessor implements NodeProcessor {
             if (cteNode.getToken().getType() == HiveParser.TOK_SUBQUERY) {
                 ASTNode aliasNode = (ASTNode) cteNode.getChild(1);
                 if (aliasNode != null && aliasNode.getToken().getType() == HiveParser.Identifier) {
-                    tableNames.add(aliasNode.getText());
+                    String cteName = BaseSemanticAnalyzer.getUnescapedName(aliasNode);
+                    cteNames.add(cteName); // Add CTE name to the set
+                    extractTableNamesFromQuery((ASTNode) cteNode.getChild(0)); // Process the CTE query
                 }
-                extractTableNamesFromQuery((ASTNode) cteNode.getChild(0));
             }
         }
     }
 
     public List<String> getTableNames() {
-        return tableNames;
+        return tableNames.stream()
+                .filter(name -> !cteNames.contains(name))
+                .collect(Collectors.toList());
+    }
+
+    public static void reinitializeContext() {
+        HiveConf hiveConf = new HiveConf();
+        if (hiveConf.get(HDFS_SESSION_PATH_KEY) == null) {
+            hiveConf.set(HDFS_SESSION_PATH_KEY, hdfsTemporaryDirectory(hiveConf));
+        }
+        if (hiveConf.get(LOCAL_SESSION_PATH_KEY) == null) {
+            hiveConf.set(LOCAL_SESSION_PATH_KEY, localTemporaryDirectory());
+        }
+        try {
+            context = new Context(hiveConf);
+        } catch (IOException e) {
+            logger.error("Init hive context fail, message: " + e);
+        }
+    }
+
+    public static void main(String[] args) {
+        try {
+            HiveSqlParser processor = new HiveSqlParser();
+            processor.parse("with cte_table as (select id, name from test.my_table) select * from cte_table");
+            System.out.println("Tables: " + processor.getTableNames());
+        } catch (ParseException | SemanticException e) {
+            e.printStackTrace();
+        }
     }
 }
